@@ -5,7 +5,7 @@ from app.database import get_db
 from app.models import User, Problem, Submission
 from app.schemas import ProblemListResponse, ProblemDetailResponse, QueryRequest, ProblemCreate, TestCaseCreate, ProblemValidateRequest, TrendingProblem
 from app.routers.auth import get_current_user
-from app.services.sandbox import run_sandbox
+from app.services.sandbox import run_sandbox, run_validate_sandbox
 import uuid
 import datetime
 from sqlalchemy import func
@@ -244,10 +244,39 @@ def get_problem(problem_id: str, context: Optional[str] = None, db: Session = De
         
     return resp
 
+def validate_all_test_cases_before_save(db: Session, problem_data: ProblemCreate):
+    """
+    Hàm này duyệt qua tất cả test cases, gọi sandbox để chạy thử.
+    Nếu bất kỳ test case nào lỗi -> văng HTTPException ngay lập tức.
+    """
+    test_cases_to_run = problem_data.test_cases if problem_data.test_cases else [
+        TestCaseCreate(
+            schema_sql=problem_data.schema_sql, 
+            seed_data=problem_data.seed_data, 
+            is_hidden=False
+        )
+    ]
+    
+    for idx, tc in enumerate(test_cases_to_run):
+        schema = tc.schema_sql or problem_data.schema_sql
+        seed = tc.seed_data
+        ref_solution = problem_data.reference_solution
+        
+        if not ref_solution:
+            raise HTTPException(status_code=400, detail="Thiếu reference_solution.")
+            
+        result = run_validate_sandbox(db, schema, seed, ref_solution)
+        
+        if result["status"] == "Error":
+            error_msg = f"Lỗi ở Test Case {idx + 1}: {result['message']}"
+            raise HTTPException(status_code=400, detail=error_msg)
+
 @router.put("/{problem_id}", response_model=ProblemDetailResponse)
 def update_problem(problem_id: str, problem: ProblemCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if current_user.role not in ["instructor", "admin"]:
         raise HTTPException(status_code=403, detail="Chỉ Giảng viên và Admin mới có quyền sửa bài tập.")
+        
+    validate_all_test_cases_before_save(db, problem)
         
     p = db.query(Problem).filter(Problem.id == problem_id).first()
     if not p:
@@ -361,6 +390,8 @@ def delete_problem(problem_id: str, db: Session = Depends(get_db), current_user:
 def create_problem(problem: ProblemCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if current_user.role not in ["instructor", "admin"]:
         raise HTTPException(status_code=403, detail="Chỉ Giảng viên và Admin mới có quyền tạo bài tập.")
+        
+    validate_all_test_cases_before_save(db, problem)
         
     prob_id = str(uuid.uuid4())
     topics_list = [t.strip() for t in problem.topics.split(",")] if problem.topics else []

@@ -6,16 +6,60 @@ from app.models import Problem, Submission
 from typing import Dict, Any, Tuple
 import datetime
 import uuid
-
+import re
+import concurrent.futures
 class SandboxError(Exception):
     pass
+
+def format_sql_error(error_str: str) -> str:
+    """ Clean up pyodbc/SQLAlchemy error messages to be user friendly """
+    # Extract the core SQL Server message if present
+    match = re.search(r"\[SQL Server\](.*?)(\(\d+\)|\"\))", error_str)
+    if match:
+        msg = match.group(1).strip()
+    else:
+        # Fallback parsing
+        msg = error_str.split("[SQL:")[0].strip()
+        msg = re.sub(r"\(pyodbc\.[^)]+\)\s*", "", msg)
+        msg = re.sub(r"\('[^']+',\s*\"\[[^\]]+\]\s*\[[^\]]+\]\s*\[[^\]]+\]", "", msg)
+        
+    # Remove the sandbox '#' prefix to hide internal details
+    msg = re.sub(r"#([a-zA-Z0-9_]+)", r"\1", msg)
+    
+    return msg
+
+def format_sqlglot_error(e: Exception) -> str:
+    """ Clean up sqlglot ParseError to be user friendly """
+    if hasattr(e, 'errors') and isinstance(e.errors, list) and len(e.errors) > 0:
+        err = e.errors[0]
+        desc = err.get('description', '')
+        # Hide python class names like <class 'sqlglot.expressions.core.Mul'>
+        desc = re.sub(r"<class '.*?'>", "từ khóa/biểu thức", desc)
+        
+        line = err.get('line', '?')
+        col = err.get('col', '?')
+        
+        start = err.get('start_context', '')
+        highlight = err.get('highlight', '')
+        end = err.get('end_context', '')
+        
+        snippet = f"{start}[{highlight}]{end}"
+        return f"{desc} tại Dòng {line}, Cột {col}.\nĐoạn mã: {snippet}"
+    
+    # Fallback: remove ANSI escape codes from raw string
+    raw = str(e)
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    raw = ansi_escape.sub('', raw)
+    raw = re.sub(r"<class '.*?'>", "từ khóa/biểu thức", raw)
+    return raw
 
 def rewrite_query(query: str) -> str:
     """ Phân tích và đổi tên các bảng thành bảng tạm (ví dụ: Customers -> #Customers) """
     try:
         parsed = sqlglot.parse_one(query, read="tsql")
     except Exception as e:
-        raise SandboxError(f"Lỗi cú pháp SQL: {str(e)}")
+        clean_msg = format_sqlglot_error(e)
+        raise SandboxError(f"Lỗi cú pháp SQL:\n{clean_msg}")
 
     # Chặn các lệnh nguy hiểm (Chỉ cho phép SELECT, CTE)
     forbidden = (exp.Drop, exp.Alter, exp.Delete, exp.Update, exp.Insert, exp.Command, exp.Commit, exp.Rollback)
@@ -23,11 +67,15 @@ def rewrite_query(query: str) -> str:
         if isinstance(node, forbidden):
             raise SandboxError(f"Không được phép sử dụng lệnh: {type(node).__name__.upper()}")
             
-    # Tìm tất cả các bảng và thêm tiền tố #
+    # Đổi tên các CTE definition để có tiền tố # (chống bypass sandbox bằng cách đặt tên CTE trùng tên bảng thật)
+    for cte in parsed.find_all(exp.CTE):
+        if cte.alias and not cte.alias.startswith("#"):
+            cte.args["alias"].set("this", exp.Identifier(this=f"#{cte.alias}"))
+
     for table in parsed.find_all(exp.Table):
-        # Tránh thêm # vào các hàm hệ thống hoặc các bảng đã có #
+        # Đổi tất cả các table reference thành tiền tố #
         if table.name and not table.name.startswith("#"):
-            table.set("this", f"#{table.name}")
+            table.set("this", exp.Identifier(this=f"#{table.name}"))
             
     return parsed.sql(dialect="tsql")
 
@@ -101,7 +149,8 @@ def execute_query(db: Session, rewritten_query: str) -> Dict[str, Any]:
     except concurrent.futures.TimeoutError:
         raise SandboxError("TIME_LIMIT_EXCEEDED")
     except Exception as e:
-        raise SandboxError(f"Lỗi thực thi SQL: {str(e)}")
+        clean_msg = format_sql_error(str(e))
+        raise SandboxError(f"Lỗi cú pháp hoặc thực thi: {clean_msg}")
 
 def compare_results(actual: Dict[str, Any], expected: Dict[str, Any]) -> Tuple[bool, str]:
     """ So sánh kết quả thực thi với đáp án """
@@ -137,7 +186,8 @@ def rewrite_setup_script(script: str) -> str:
     try:
         statements = sqlglot.parse(script, read="tsql")
     except Exception as e:
-        raise SandboxError(f"Lỗi cú pháp SQL trong setup: {str(e)}")
+        clean_msg = format_sqlglot_error(e)
+        raise SandboxError(f"Lỗi cú pháp SQL trong setup:\n{clean_msg}")
 
     forbidden = (exp.Drop, exp.Alter, exp.Delete, exp.Update, exp.Command, exp.Commit, exp.Rollback)
     
@@ -148,9 +198,14 @@ def rewrite_setup_script(script: str) -> str:
             if isinstance(node, forbidden):
                 raise SandboxError(f"Không được phép: {type(node).__name__.upper()} trong setup")
                 
+        # Đổi tên các CTE definition để có tiền tố #
+        for cte in parsed.find_all(exp.CTE):
+            if cte.alias and not cte.alias.startswith("#"):
+                cte.args["alias"].set("this", exp.Identifier(this=f"#{cte.alias}"))
+                
         for table in parsed.find_all(exp.Table):
             if table.name and not table.name.startswith("#"):
-                table.set("this", f"#{table.name}")
+                table.set("this", exp.Identifier(this=f"#{table.name}"))
                 
         rewritten_statements.append(parsed.sql(dialect="tsql"))
         
@@ -174,10 +229,14 @@ def seed_sandbox_data_scripts(db: Session, schema_sql: str, seed_data: str):
     rewritten_schema = rewrite_setup_script(schema_sql)
     rewritten_seed = rewrite_setup_script(seed_data)
     
-    if rewritten_schema:
-        db.execute(text(rewritten_schema))
-    if rewritten_seed:
-        db.execute(text(rewritten_seed))
+    try:
+        if rewritten_schema:
+            db.execute(text(rewritten_schema))
+        if rewritten_seed:
+            db.execute(text(rewritten_seed))
+    except Exception as e:
+        clean_msg = format_sql_error(str(e))
+        raise SandboxError(f"Lỗi thực thi dữ liệu mẫu (Schema/Seed Data):\n{clean_msg}")
 
 def run_validate_sandbox(db: Session, schema_sql: str, seed_data: str, query: str) -> Dict[str, Any]:
     try:
@@ -192,7 +251,8 @@ def run_validate_sandbox(db: Session, schema_sql: str, seed_data: str, query: st
     except SandboxError as e:
         return {"status": "Error", "message": str(e)}
     except Exception as e:
-        return {"status": "Error", "message": f"Validation failed: {str(e)}"}
+        clean_msg = format_sql_error(str(e))
+        return {"status": "Error", "message": f"Validation failed: {clean_msg}"}
 
 def run_sandbox(db: Session, problem: Problem, query: str, is_submit: bool) -> Dict[str, Any]:
     try:
@@ -292,4 +352,5 @@ def run_sandbox(db: Session, problem: Problem, query: str, is_submit: bool) -> D
             return {"status": "Time Limit Exceeded", "message": "Truy vấn chạy quá thời gian cho phép (5s)."}
         return {"status": "Runtime Error", "message": str(e)}
     except Exception as e:
-        return {"status": "Runtime Error", "message": f"Lỗi hệ thống không xác định: {str(e)}"}
+        clean_msg = format_sql_error(str(e))
+        return {"status": "Runtime Error", "message": f"Lỗi hệ thống không xác định: {clean_msg}"}
