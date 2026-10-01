@@ -35,10 +35,9 @@ def get_overview_stats(db: Session = Depends(get_db), admin_user: models.User = 
     today_start = datetime(today.year, today.month, today.day)
     submissions_today = db.query(models.Submission).filter(models.Submission.submitted_at >= today_start).count()
     
-    # Grading errors
+    # Grading errors (only track actual System Errors)
     grading_errors = db.query(models.Submission).filter(
-        (models.Submission.result.ilike("%error%")) | 
-        (models.Submission.result.ilike("%timeout%"))
+        models.Submission.result == "System Error"
     ).count()
     
     pending_requests = db.query(models.User).filter(
@@ -78,8 +77,7 @@ def get_activities(db: Session = Depends(get_db), admin_user: models.User = Depe
 @router.get("/errors", response_model=List[schemas.GradingErrorResponse])
 def get_errors(db: Session = Depends(get_db), admin_user: models.User = Depends(check_admin_role)):
     errors = db.query(models.Submission).filter(
-        (models.Submission.result.ilike("%error%")) | 
-        (models.Submission.result.ilike("%timeout%"))
+        models.Submission.result == "System Error"
     ).order_by(models.Submission.submitted_at.desc()).limit(5).all()
     
     results = []

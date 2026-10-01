@@ -353,4 +353,4 @@ def run_sandbox(db: Session, problem: Problem, query: str, is_submit: bool) -> D
         return {"status": "Runtime Error", "message": str(e)}
     except Exception as e:
         clean_msg = format_sql_error(str(e))
-        return {"status": "Runtime Error", "message": f"Lỗi hệ thống không xác định: {clean_msg}"}
+        return {"status": "System Error", "message": f"Lỗi hệ thống không xác định: {clean_msg}"}
