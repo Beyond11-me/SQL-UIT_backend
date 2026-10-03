@@ -405,3 +405,14 @@ class AssignmentResponse(CamelModel):
     problem_list: List[BuilderProblem] = Field(..., alias="problemList")
     class_ids: List[str] = Field(..., alias="classIds")
 
+class BulkImportResponse(BaseModel):
+    total_processed: int
+    success_count: int
+    failed_count: int
+    errors: List[Dict[str, Any]]
+class ClassMemberImportResponse(BaseModel):
+    total_processed: int
+    success_count: int
+    skipped_count: int
+    failed_count: int
+    errors: List[Dict[str, Any]]

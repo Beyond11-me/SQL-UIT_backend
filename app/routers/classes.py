@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile
 from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
@@ -192,3 +192,71 @@ def remove_class_member(
     db.commit()
     
     return {"message": "Member removed successfully"}
+
+@router.post("/{class_id}/members/import", response_model=schemas.ClassMemberImportResponse)
+def import_class_members_from_csv(
+    class_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(check_instructor_role)
+):
+    if current_user.role.lower() == "admin":
+        c = db.query(models.Class).filter(models.Class.id == class_id).first()
+    else:
+        c = db.query(models.Class).filter(models.Class.id == class_id, models.Class.instructor_id == current_user.id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Class not found or you don't have access")
+
+    content = file.file.read().decode('utf-8-sig')
+    
+    # Extract emails: we look at lines and split by common delimiters just in case, but usually one email per line.
+    import re
+    # Find all things that look like emails
+    emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', content)
+    
+    # Deduplicate emails (case-insensitive)
+    emails_set = set([e.lower().strip() for e in emails if e.strip()])
+    
+    total_processed = len(emails_set)
+    success_count = 0
+    skipped_count = 0
+    failed_count = 0
+    errors = []
+    
+    if total_processed == 0:
+        raise HTTPException(status_code=400, detail="Không tìm thấy email nào hợp lệ trong file.")
+        
+    for email in emails_set:
+        student = db.query(models.User).filter(models.User.email.ilike(email), models.User.role == "student").first()
+        if not student:
+            failed_count += 1
+            errors.append({"email": email, "error": "Sinh viên không tồn tại trong hệ thống."})
+            continue
+            
+        existing_enrollment = db.query(models.ClassEnrollment).filter(
+            models.ClassEnrollment.class_id == class_id,
+            models.ClassEnrollment.student_id == student.id
+        ).first()
+        
+        if existing_enrollment:
+            skipped_count += 1
+            continue
+            
+        enrollment = models.ClassEnrollment(
+            class_id=class_id,
+            student_id=student.id,
+            role="Member",
+            joined_at=datetime.utcnow()
+        )
+        db.add(enrollment)
+        success_count += 1
+        
+    db.commit()
+    
+    return {
+        "total_processed": total_processed,
+        "success_count": success_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "errors": errors
+    }

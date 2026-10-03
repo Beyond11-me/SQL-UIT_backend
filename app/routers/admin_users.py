@@ -1,5 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
+import csv
+import io
 from typing import List
 from datetime import datetime
 
@@ -147,6 +149,74 @@ def create_admin_user(
         last_active=last_active,
         joined=joined,
         detail=new_user.department or ""
+    )
+
+@router.post("/import", response_model=schemas.BulkImportResponse)
+def import_users_from_csv(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    admin_user: models.User = Depends(check_admin_role)
+):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Chỉ hỗ trợ định dạng file CSV")
+
+    content = file.file.read().decode('utf-8-sig') # Handle BOM if present
+    csv_reader = csv.DictReader(io.StringIO(content))
+    
+    success_count = 0
+    errors = []
+    
+    for row_number, row in enumerate(csv_reader, start=2):
+        # Normalize keys to lowercase for robust matching
+        normalized_row = {k.strip().lower(): v for k, v in row.items() if k}
+        
+        email = normalized_row.get("email", "").strip()
+        name = normalized_row.get("name", "").strip()
+        role = normalized_row.get("role", "Student").strip()
+        password = normalized_row.get("password", "12354678").strip()
+        
+        if not email or not name:
+            errors.append({"row": row_number, "email": email, "error": "Thiếu thông tin bắt buộc (email hoặc name)"})
+            continue
+            
+        existing_user = db.query(models.User).filter(models.User.email == email).first()
+        if existing_user:
+            errors.append({"row": row_number, "email": email, "error": "Email đã tồn tại"})
+            continue
+            
+        db_role = "student"
+        if role.lower() in ["lecturer", "instructor"]:
+            db_role = "instructor"
+        elif role.lower() == "admin":
+            db_role = "admin"
+            
+        new_user = models.User(
+            email=email,
+            hashed_password=get_password_hash(password),
+            name=name,
+            initials="".join([n[0] for n in name.split() if n])[:2].upper(),
+            role=db_role,
+            status="Active",
+            department=""
+        )
+        db.add(new_user)
+        success_count += 1
+        
+    db.commit()
+    
+    if success_count > 0:
+        log = models.ActivityLog(
+            user_id=admin_user.id,
+            action=f"Bulk imported {success_count} users from {file.filename}"
+        )
+        db.add(log)
+        db.commit()
+        
+    return schemas.BulkImportResponse(
+        total_processed=success_count + len(errors),
+        success_count=success_count,
+        failed_count=len(errors),
+        errors=errors
     )
 
 @router.get("/lecturer-requests", response_model=List[schemas.LecturerRequestResponse])
